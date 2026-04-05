@@ -90,7 +90,15 @@ LongCat-AudioDiT obtains state-of-the-art (SOTA) voice cloning performance on th
 
 ## Installation
 
+### As a Python Package
 ```bash
+pip install git+https://github.com/meituan-longcat/LongCat-AudioDiT
+```
+
+### Development
+
+```bash
+git clone https://github.com/meituan-longcat/LongCat-AudioDiT
 pip install -r requirements.txt
 ```
 
