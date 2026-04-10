@@ -17,7 +17,6 @@ import time
 import numpy as np
 import soundfile as sf
 import torch
-import torch.nn.functional as F
 
 import audiodit
 from audiodit import AudioDiTModel
@@ -41,16 +40,8 @@ def infer_one(gen_text, prompt_text, prompt_wav_path, model, tokenizer, device,
     inputs = tokenizer([full_text], padding="longest", return_tensors="pt")
     prompt_wav = load_audio(prompt_wav_path, sr).unsqueeze(0)
 
-    # Duration estimation
-    off = 3
-    pw = load_audio(prompt_wav_path, sr)
-    if pw.shape[-1] % full_hop != 0:
-        pw = F.pad(pw, (0, full_hop - pw.shape[-1] % full_hop))
-    pw = F.pad(pw, (0, full_hop * off))
-    plt = model.vae.encode(pw.unsqueeze(0).to(device))
-    if off:
-        plt = plt[..., :-off]
-    prompt_dur = plt.shape[-1]
+    # Encode prompt audio once (reused for duration estimation and generation)
+    prompt_latent, prompt_dur = model.encode_prompt_audio(prompt_wav.to(device))
 
     prompt_time = prompt_dur * full_hop / sr
     dur_sec = approx_duration_from_text(gen_text, max_duration - prompt_time)
@@ -63,7 +54,8 @@ def infer_one(gen_text, prompt_text, prompt_wav_path, model, tokenizer, device,
     output = model(
         input_ids=inputs.input_ids,
         attention_mask=inputs.attention_mask,
-        prompt_audio=prompt_wav,
+        prompt_latent=prompt_latent,
+        prompt_duration_frames=prompt_dur,
         duration=duration,
         steps=nfe,
         cfg_strength=cfg_strength,
