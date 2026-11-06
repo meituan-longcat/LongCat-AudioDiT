@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from torch import nn
 from torch.nn.utils import weight_norm
 from torch.nn.utils.rnn import pad_sequence
@@ -53,15 +54,13 @@ def odeint_euler(fn, y0, t):
         t: 1-D tensor of time steps (must be monotonically increasing)
 
     Returns:
-        Tensor of shape `(len(t), *y0.shape)` containing the trajectory.
+        Final state tensor with the same shape as *y0*.
     """
-    ys = [y0]
     y = y0
     for i in range(len(t) - 1):
         dt = t[i + 1] - t[i]
         y = y + fn(t[i], y) * dt
-        ys.append(y)
-    return torch.stack(ys)
+    return y
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +297,7 @@ class AudioDiTSelfAttention(nn.Module):
         if qk_norm:
             self.q_norm = AudioDiTRMSNorm(self.inner_dim, eps=eps)
             self.k_norm = AudioDiTRMSNorm(self.inner_dim, eps=eps)
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, dim, bias=bias), nn.Dropout(dropout)])
+        self.to_out = nn.Sequential(nn.Linear(self.inner_dim, dim, bias=bias), nn.Dropout(dropout))
 
     def forward(self, x: torch.Tensor, mask: torch.BoolTensor | None = None, rope: tuple | None = None) -> torch.Tensor:
         batch_size = x.shape[0]
@@ -320,9 +319,7 @@ class AudioDiTSelfAttention(nn.Module):
             attn_mask = mask.unsqueeze(1).unsqueeze(1).expand(batch_size, self.heads, query.shape[-2], key.shape[-2])
         x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         x = x.transpose(1, 2).reshape(batch_size, -1, self.inner_dim).to(query.dtype)
-        x = self.to_out[0](x)
-        x = self.to_out[1](x)
-        return x
+        return self.to_out(x)
 
 
 class AudioDiTCrossAttention(nn.Module):
@@ -337,7 +334,7 @@ class AudioDiTCrossAttention(nn.Module):
         if qk_norm:
             self.q_norm = AudioDiTRMSNorm(self.inner_dim, eps=eps)
             self.k_norm = AudioDiTRMSNorm(self.inner_dim, eps=eps)
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, q_dim, bias=bias), nn.Dropout(dropout)])
+        self.to_out = nn.Sequential(nn.Linear(self.inner_dim, q_dim, bias=bias), nn.Dropout(dropout))
 
     def forward(
         self, x: torch.Tensor, cond: torch.Tensor, mask: torch.BoolTensor | None = None,
@@ -364,9 +361,7 @@ class AudioDiTCrossAttention(nn.Module):
             attn_mask = attn_mask.expand(batch_size, self.heads, query.shape[-2], key.shape[-2])
         x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         x = x.transpose(1, 2).reshape(batch_size, -1, self.inner_dim).to(query.dtype)
-        x = self.to_out[0](x)
-        x = self.to_out[1](x)
-        return x
+        return self.to_out(x)
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +439,6 @@ class AudioDiTBlock(nn.Module):
             adaln_out = self.adaln_mlp(norm_cond)
             gate_sa, scale_sa, shift_sa, gate_ffn, scale_ffn, shift_ffn = torch.chunk(adaln_out, 6, dim=-1)
         else:
-            from einops import rearrange
             adaln_out = adaln_global_out + rearrange(self.adaln_scale_shift, "f -> 1 f")
             gate_sa, scale_sa, shift_sa, gate_ffn, scale_ffn, shift_ffn = torch.chunk(adaln_out, 6, dim=-1)
 
@@ -997,6 +991,8 @@ class AudioDiTModel(AudioDiTPreTrainedModel):
         attention_mask: torch.LongTensor | None = None,
         text_embedding: torch.FloatTensor | None = None,
         prompt_audio: torch.FloatTensor | None = None,
+        prompt_latent: torch.FloatTensor | None = None,
+        prompt_duration_frames: int | None = None,
         duration: int | None = None,
         steps: int = 16,
         cfg_strength: float = 4.0,
@@ -1010,6 +1006,11 @@ class AudioDiTModel(AudioDiTPreTrainedModel):
             attention_mask: Attention mask ``(batch, seq_len)``.
             text_embedding: Pre-computed text embeddings ``(batch, seq_len, dim)``. Alternative to input_ids.
             prompt_audio: Optional prompt audio ``(batch, 1, num_samples)`` for voice cloning.
+            prompt_latent: Pre-encoded prompt latent ``(batch, num_frames, latent_dim)`` from
+                ``encode_prompt_audio()``. Use instead of ``prompt_audio`` to avoid redundant
+                VAE encoding when the latent is already available.
+            prompt_duration_frames: Number of prompt latent frames. Required when
+                ``prompt_latent`` is provided.
             duration: Target duration in latent frames (prompt + gen). If None, uses max_wav_duration.
             steps: Number of ODE Euler steps (default 16).
             cfg_strength: Guidance strength for CFG/APG (default 4.0).
@@ -1040,7 +1041,10 @@ class AudioDiTModel(AudioDiTPreTrainedModel):
         batch = text_condition.shape[0]
 
         # ── prompt audio encoding ─────────────────────────────────────
-        if prompt_audio is not None:
+        if prompt_latent is not None:
+            prompt_latent = prompt_latent.to(device)
+            prompt_dur = prompt_duration_frames
+        elif prompt_audio is not None:
             prompt_latent, prompt_dur = self.encode_prompt_audio(prompt_audio)
         else:
             prompt_latent = torch.empty(batch, 0, self.config.latent_dim, device=device)
@@ -1061,7 +1065,7 @@ class AudioDiTModel(AudioDiTPreTrainedModel):
         neg_text_len = text_condition_len
 
         latent_len = prompt_dur
-        if prompt_audio is not None:
+        if prompt_dur > 0:
             gen_len = max_dur - latent_len
             latent_cond = F.pad(prompt_latent, (0, 0, 0, gen_len))
             empty_latent_cond = torch.zeros_like(latent_cond)
@@ -1075,6 +1079,7 @@ class AudioDiTModel(AudioDiTPreTrainedModel):
 
         # ── ODE function ──────────────────────────────────────────────
         def fn(t, x):
+            x = x.clone()
             x[:, :latent_len] = prompt_noise * (1-t) + latent_cond[:, :latent_len] * t
             output = self.transformer(
                 x=x, text=text_condition, text_len=text_condition_len, time=t,
@@ -1120,12 +1125,11 @@ class AudioDiTModel(AudioDiTPreTrainedModel):
         # ── ODE solve ─────────────────────────────────────────────────
         t = torch.linspace(0, 1, steps, device=device)
         prompt_noise = y0[:, :latent_len].clone()
-        trajectory = odeint_euler(fn, y0, t)
-        sampled = trajectory[-1]
+        sampled = odeint_euler(fn, y0, t)
 
         # ── decode ────────────────────────────────────────────────────
         pred_latent = sampled
-        if prompt_audio is not None:
+        if prompt_dur > 0:
             pred_latent = pred_latent[:, prompt_dur:]
 
         pred_latent = pred_latent.permute(0, 2, 1).float()
@@ -1153,14 +1157,14 @@ class _MomentumBuffer:
 
 def _project(v0: torch.Tensor, v1: torch.Tensor, dims=(-1, -2)):
     dtype = v0.dtype
-    device_type = v0.device.type
-    if device_type == "mps":
+    orig_device = v0.device
+    if orig_device.type == "mps":
         v0, v1 = v0.cpu(), v1.cpu()
     v0, v1 = v0.double(), v1.double()
     v1 = F.normalize(v1, dim=dims)
     v0_parallel = (v0 * v1).sum(dim=dims, keepdim=True) * v1
     v0_orthogonal = v0 - v0_parallel
-    return v0_parallel.to(dtype).to(device_type), v0_orthogonal.to(dtype).to(device_type)
+    return v0_parallel.to(dtype=dtype, device=orig_device), v0_orthogonal.to(dtype=dtype, device=orig_device)
 
 
 def _apg_forward(pred_cond, pred_uncond, guidance_scale, momentum_buffer=None, eta=0.0, norm_threshold=2.5, dims=(-1, -2)):

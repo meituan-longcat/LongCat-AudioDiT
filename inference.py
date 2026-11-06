@@ -20,7 +20,6 @@ import argparse
 import numpy as np
 import soundfile as sf
 import torch
-import torch.nn.functional as F
 
 import audiodit  # auto-registers AudioDiTConfig/AudioDiTModel
 from audiodit import AudioDiTModel
@@ -74,19 +73,12 @@ def main():
     if not no_prompt:
         prompt_wav = load_audio(args.prompt_audio, sr).unsqueeze(0)
 
-        # Compute prompt duration for time estimation
-        off = 3
-        pw = load_audio(args.prompt_audio, sr)
-        if pw.shape[-1] % full_hop != 0:
-            pw = F.pad(pw, (0, full_hop - pw.shape[-1] % full_hop))
-        pw = F.pad(pw, (0, full_hop * off))
+        # Encode prompt audio once (reused for duration estimation and generation)
         with torch.no_grad():
-            plt = model.vae.encode(pw.unsqueeze(0).to(device))
-        if off:
-            plt = plt[..., :-off]
-        prompt_dur = plt.shape[-1]
+            prompt_latent, prompt_dur = model.encode_prompt_audio(prompt_wav.to(device))
     else:
         prompt_wav = None
+        prompt_latent = None
         prompt_dur = 0
 
     # Duration estimation
@@ -104,7 +96,8 @@ def main():
     output = model(
         input_ids=inputs.input_ids,
         attention_mask=inputs.attention_mask,
-        prompt_audio=prompt_wav,
+        prompt_latent=prompt_latent,
+        prompt_duration_frames=prompt_dur if prompt_latent is not None else None,
         duration=duration,
         steps=args.nfe,
         cfg_strength=args.guidance_strength,
